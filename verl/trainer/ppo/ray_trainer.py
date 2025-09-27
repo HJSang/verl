@@ -338,6 +338,9 @@ class RayPPOTrainer:
         if self.config.algorithm.use_kl_in_reward:
             self.kl_ctrl_in_reward = core_algos.get_kl_controller(self.config.algorithm.kl_ctrl)
 
+        # Initialize rollout allocation schedule
+        self.rollout_allocation_schedule = self._create_rollout_allocation_schedule(config)
+
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
 
     def _create_dataloader(self, train_dataset, val_dataset, collate_fn, train_sampler: Optional[Sampler]):
@@ -413,6 +416,67 @@ class RayPPOTrainer:
                     self.config.critic.optim.total_training_steps = total_training_steps
         except Exception as e:
             print(f"Warning: Could not set total_training_steps in config. Structure missing? Error: {e}")
+
+    def _create_rollout_allocation_schedule(self, config):
+        """Create rollout allocation schedule from config."""
+        from verl.trainer.ppo.rollout_allocation_schedule import create_rollout_allocation_schedule
+        
+        schedule_config = config.get("rollout_allocation_schedule", {})
+        return create_rollout_allocation_schedule(schedule_config)
+
+    def _create_rollout_only_config(self):
+        """Create rollout-only config by inheriting from actor_rollout_ref.rollout."""
+        from omegaconf import OmegaConf
+        
+        # Start with actor_rollout_ref.rollout config
+        rollout_config = OmegaConf.create(self.config.actor_rollout_ref.rollout)
+        
+        # Override model path
+        rollout_config.model.path = self.config.rollout_only.model_path
+        
+        # Override sampling parameters
+        rollout_config.temperature = self.config.rollout_only.get("temperature", rollout_config.temperature)
+        rollout_config.top_p = self.config.rollout_only.get("top_p", rollout_config.top_p)
+        rollout_config.top_k = self.config.rollout_only.get("top_k", rollout_config.top_k)
+        
+        # Ensure calculate_log_probs is True for rollout-only
+        rollout_config.calculate_log_probs = True
+        
+        return rollout_config
+
+
+    def _generate_actor_rollouts(self, gen_batch: DataProto) -> DataProto:
+        """Generate rollouts from actor policy only."""
+        # Use existing rollout logic
+        if not self.async_rollout_mode:
+            gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
+        else:
+            gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch)
+        
+        # Mark as actor policy
+        gen_batch_output.meta_info["policy_type"] = "current"
+        return gen_batch_output
+
+    def _generate_fixed_rollouts(self, gen_batch: DataProto) -> DataProto:
+        """Generate rollouts from fixed policy only."""
+        if self.rollout_only_wg is None:
+            raise ValueError("Rollout-only worker not initialized. Check rollout_only.model_path in config.")
+        
+        # Use rollout-only worker
+        gen_batch_output = self.rollout_only_wg.generate_sequences(gen_batch)
+        
+        # Mark as fixed policy
+        gen_batch_output.meta_info["policy_type"] = "reference"
+        return gen_batch_output
+
+    def _generate_rollouts(self, gen_batch: DataProto) -> DataProto:
+        """Generate rollouts based on allocation schedule."""
+        policy_choice = self.rollout_allocation_schedule.get_policy_choice(self.global_steps)
+        
+        if policy_choice == "actor":
+            return self._generate_actor_rollouts(gen_batch)
+        else:
+            return self._generate_fixed_rollouts(gen_batch)
 
     def _dump_generations(self, inputs, outputs, gts, scores, reward_extra_infos_dict, dump_path):
         """Dump rollout/validation samples as JSONL."""
@@ -705,6 +769,20 @@ class RayPPOTrainer:
             rm_cls = RayClassWithInitArgs(self.role_worker_mapping[Role.RewardModel], config=self.config.reward_model)
             self.resource_pool_to_cls[resource_pool]["rm"] = rm_cls
 
+        # create rollout-only worker if configured
+        if Role.RolloutOnly in self.role_worker_mapping:
+            resource_pool = self.resource_pool_manager.get_resource_pool(Role.RolloutOnly)
+            
+            # Create config by inheriting from actor_rollout_ref.rollout and overriding specific fields
+            rollout_only_config = self._create_rollout_only_config()
+            
+            rollout_only_cls = RayClassWithInitArgs(
+                cls=self.role_worker_mapping[Role.RolloutOnly],
+                config=rollout_only_config,
+                role="rollout",  # Use "rollout" role for fixed policy
+            )
+            self.resource_pool_to_cls[resource_pool]["rollout_only"] = rollout_only_cls
+
         # initialize WorkerGroup
         # NOTE: if you want to use a different resource pool for each role, which can support different parallel size,
         # you should not use `create_colocated_worker_cls`.
@@ -749,6 +827,12 @@ class RayPPOTrainer:
         if self.use_rm:
             self.rm_wg = all_wg["rm"]
             self.rm_wg.init_model()
+
+        # Initialize rollout-only worker if configured
+        self.rollout_only_wg = None
+        if Role.RolloutOnly in self.role_worker_mapping:
+            self.rollout_only_wg = all_wg["rollout_only"]
+            self.rollout_only_wg.init_model()
 
         # we should create rollout at the end so that vllm can have a better estimation of kv cache memory
         self.actor_rollout_wg = all_wg["actor_rollout"]
@@ -997,14 +1081,19 @@ class RayPPOTrainer:
 
                 is_last_step = self.global_steps >= self.total_training_steps
                 with marked_timer("step", timing_raw):
-                    # generate a batch
+                    # generate a batch using allocation schedule
                     with marked_timer("gen", timing_raw, color="red"):
-                        if not self.async_rollout_mode:
-                            gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
-                        else:
-                            gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch)
+                        gen_batch_output = self._generate_rollouts(gen_batch)
+                        
+                        # Log policy choice for monitoring
+                        policy_choice = gen_batch_output.meta_info.get("policy_type", "unknown")
+                        metrics.update({
+                            "rollout/policy_choice": 1 if policy_choice == "current" else 0,
+                            "rollout/using_actor": policy_choice == "current",
+                            "rollout/using_fixed": policy_choice == "reference"
+                        })
 
-                        timing_raw.update(gen_batch_output.meta_info["timing"])
+                        timing_raw.update(gen_batch_output.meta_info.get("timing", {}))
                         gen_batch_output.meta_info.pop("timing", None)
 
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
@@ -1057,7 +1146,17 @@ class RayPPOTrainer:
 
                     # recompute old_log_probs
                     with marked_timer("old_log_prob", timing_raw, color="blue"):
-                        old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
+                        # For fixed policy samples, use fixed policy to calculate old_log_probs
+                        # For actor samples, use current actor policy
+                        policy_type = batch.meta_info.get("policy_type", "current")
+                        
+                        if policy_type == "reference" and self.rollout_only_wg is not None:
+                            # Use fixed policy to calculate old_log_probs for importance sampling
+                            old_log_prob = self.rollout_only_wg.compute_log_prob(batch)
+                        else:
+                            # Use current actor policy (standard PPO)
+                            old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
+                        
                         entropys = old_log_prob.batch["entropys"]
                         response_masks = batch.batch["response_mask"]
                         loss_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
@@ -1131,12 +1230,21 @@ class RayPPOTrainer:
 
                     # implement critic warmup
                     if self.config.trainer.critic_warmup <= self.global_steps:
-                        # update actor
+                        # Always update actor, but use importance sampling for fixed policy samples
+                        policy_type = batch.meta_info.get("policy_type", "current")
+                        
                         with marked_timer("update_actor", timing_raw, color="red"):
                             batch.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
                             actor_output = self.actor_rollout_wg.update_actor(batch)
+                            
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         metrics.update(actor_output_metrics)
+                        
+                        # Log policy type for monitoring
+                        if policy_type == "reference":
+                            metrics.update({"actor/using_fixed_policy": 1})
+                        else:
+                            metrics.update({"actor/using_current_policy": 1})
 
                     # Log rollout generations if enabled
                     rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)

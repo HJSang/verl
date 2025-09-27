@@ -183,6 +183,11 @@ class TaskRunner:
 
         self.mapping[Role.ActorRollout] = global_pool_id
         self.mapping[Role.Critic] = global_pool_id
+        
+        # Map rollout-only worker to global pool if configured
+        if config.rollout_only.model_path is not None:
+            self.mapping[Role.RolloutOnly] = global_pool_id
+        
         from verl.trainer.ppo.ray_trainer import ResourcePoolManager
 
         resource_pool_manager = ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=self.mapping)
@@ -222,6 +227,37 @@ class TaskRunner:
             self.role_worker_mapping[Role.RefPolicy] = ray.remote(ref_policy_cls)
             self.mapping[Role.RefPolicy] = "global_pool"
 
+    def add_rollout_only_worker(self, config):
+        """Add rollout-only worker for fixed policy model."""
+        from verl.trainer.ppo.ray_trainer import Role
+        
+        if config.rollout_only.model_path is not None:
+            # Use the same strategy as actor for consistency
+            if config.actor_rollout_ref.actor.strategy in {"fsdp", "fsdp2"}:
+                from verl.workers.fsdp_workers import ActorRolloutRefWorker, AsyncActorRolloutRefWorker
+                
+                rollout_only_cls = (
+                    AsyncActorRolloutRefWorker
+                    if config.actor_rollout_ref.rollout.mode == "async"
+                    else ActorRolloutRefWorker
+                )
+            elif config.actor_rollout_ref.actor.strategy == "megatron":
+                from verl.workers.megatron_workers import ActorRolloutRefWorker, AsyncActorRolloutRefWorker
+                
+                rollout_only_cls = (
+                    AsyncActorRolloutRefWorker
+                    if config.actor_rollout_ref.rollout.mode == "async"
+                    else ActorRolloutRefWorker
+                )
+            else:
+                raise NotImplementedError(f"Strategy {config.actor_rollout_ref.actor.strategy} not supported for rollout-only worker")
+            
+            # Register the rollout-only worker with role="rollout"
+            self.role_worker_mapping[Role.RolloutOnly] = ray.remote(rollout_only_cls)
+            
+            return rollout_only_cls
+        return None
+
     def run(self, config):
         """Execute the main PPO training workflow.
 
@@ -256,6 +292,9 @@ class TaskRunner:
 
         # Add a reference policy worker if KL loss or KL reward is used.
         self.add_ref_policy_worker(config, actor_rollout_cls)
+
+        # Add rollout-only worker for fixed policy model if configured
+        self.add_rollout_only_worker(config)
 
         # validate config
         validate_config(

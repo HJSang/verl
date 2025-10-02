@@ -40,11 +40,15 @@ def default_compute_score(
     Raises:
         NotImplementedError: If the reward function is not implemented for the given data source.
     """
+    print(f"[DEFAULT_COMPUTE_SCORE] Computing score for data_source: {data_source}")
+    
     if data_source == "openai/gsm8k":
+        print(f"[DEFAULT_COMPUTE_SCORE] Using gsm8k.compute_score")
         from . import gsm8k
 
         res = gsm8k.compute_score(solution_str, ground_truth)
     elif data_source in ["lighteval/MATH", "DigitalLearningGmbH/MATH-lighteval", "HuggingFaceH4/MATH-500"]:
+        print(f"[DEFAULT_COMPUTE_SCORE] Using math_reward.compute_score")
         from . import math_reward
 
         res = math_reward.compute_score(solution_str, ground_truth)
@@ -56,6 +60,7 @@ def default_compute_score(
         # from . import math_verify
         # res = math_verify.compute_score(solution_str, ground_truth)
     elif data_source in ["math_dapo", "math", "math_dapo_reasoning"] or data_source.startswith("aime"):
+        print(f"[DEFAULT_COMPUTE_SCORE] Using math_dapo.compute_score")
         from . import math_dapo
 
         res = math_dapo.compute_score(solution_str, ground_truth)
@@ -67,12 +72,15 @@ def default_compute_score(
         "numina_cn_k12",
         "numina_olympiads",
     ]:
+        print(f"[DEFAULT_COMPUTE_SCORE] Using prime_math.compute_score")
         from . import prime_math
 
         res = prime_math.compute_score(solution_str, ground_truth)
     elif data_source in ["codecontests", "apps", "codeforces", "taco"]:
+        print(f"[DEFAULT_COMPUTE_SCORE] Processing code data source: {data_source}")
         # Use the passed sandbox_fusion_url if available
         if sandbox_fusion_url:
+            print(f"[DEFAULT_COMPUTE_SCORE] Using sandbox_fusion.compute_score with URL: {sandbox_fusion_url}")
             from . import sandbox_fusion
 
             # Pass the URL directly, ground_truth likely contains test cases here
@@ -80,12 +88,14 @@ def default_compute_score(
                 sandbox_fusion_url, concurrent_semaphore, memory_limit_mb, solution_str, ground_truth, continuous=True
             )
         else:
+            print(f"[DEFAULT_COMPUTE_SCORE] Using prime_code.compute_score (no sandbox URL)")
             # If no sandbox URL is provided, fall back to prime_code or raise error
             from . import prime_code
 
             # Assuming prime_code doesn't need the URL
             res = prime_code.compute_score(solution_str, ground_truth, continuous=True)
     elif data_source in ["hiyouga/geometry3k"]:
+        print(f"[DEFAULT_COMPUTE_SCORE] Using geo3k.compute_score")
         from . import geo3k
 
         res = geo3k.compute_score(solution_str, ground_truth)
@@ -98,18 +108,25 @@ def default_compute_score(
         "searchR1_musique",
         "searchR1_bamboogle",
     ]:
+        print(f"[DEFAULT_COMPUTE_SCORE] Using search_r1_like_qa_em.compute_score")
         from . import search_r1_like_qa_em
 
         res = search_r1_like_qa_em.compute_score(solution_str, ground_truth)
 
     else:
+        print(f"[DEFAULT_COMPUTE_SCORE] ERROR: No reward function implemented for data_source: {data_source}")
         raise NotImplementedError(f"Reward function is not implemented for {data_source=}")
 
+    print(f"[DEFAULT_COMPUTE_SCORE] Raw result type: {type(res)}, value: {res}")
+    
     if isinstance(res, dict):
+        print(f"[DEFAULT_COMPUTE_SCORE] Returning dictionary result")
         return res
     elif isinstance(res, int | float | bool):
+        print(f"[DEFAULT_COMPUTE_SCORE] Converting to float: {float(res)}")
         return float(res)
     else:
+        print(f"[DEFAULT_COMPUTE_SCORE] Taking first element and converting to float: {float(res[0])}")
         return float(res[0])
 
 

@@ -422,31 +422,40 @@ class RayPPOTrainer:
         from verl.trainer.ppo.rollout_allocation_schedule import create_rollout_allocation_schedule
         
         schedule_config = config.get("rollout_allocation_schedule", {})
-        return create_rollout_allocation_schedule(schedule_config)
+        schedule = create_rollout_allocation_schedule(schedule_config)
+        
+        print(f"[SCHEDULE] Created rollout allocation schedule: {schedule_config}")
+        return schedule
 
     def _create_rollout_only_config(self):
-        """Create rollout-only config by inheriting from actor_rollout_ref.rollout."""
+        """Create rollout-only config by inheriting from actor_rollout_ref."""
         from omegaconf import OmegaConf
         
-        # Start with actor_rollout_ref.rollout config
-        rollout_config = OmegaConf.create(self.config.actor_rollout_ref.rollout)
+        # Start with actor_rollout_ref config (includes both model and rollout)
+        rollout_only_config = OmegaConf.create(self.config.actor_rollout_ref)
         
         # Override model path
-        rollout_config.model.path = self.config.rollout_only.model_path
+        rollout_only_config.model.path = self.config.rollout_only.model_path
         
-        # Override sampling parameters
-        rollout_config.temperature = self.config.rollout_only.get("temperature", rollout_config.temperature)
-        rollout_config.top_p = self.config.rollout_only.get("top_p", rollout_config.top_p)
-        rollout_config.top_k = self.config.rollout_only.get("top_k", rollout_config.top_k)
+        # Override sampling parameters in rollout section
+        rollout_only_config.rollout.temperature = self.config.rollout_only.get("temperature", rollout_only_config.rollout.temperature)
+        rollout_only_config.rollout.top_p = self.config.rollout_only.get("top_p", rollout_only_config.rollout.top_p)
+        rollout_only_config.rollout.top_k = self.config.rollout_only.get("top_k", rollout_only_config.rollout.top_k)
         
         # Ensure calculate_log_probs is True for rollout-only
-        rollout_config.calculate_log_probs = True
+        rollout_only_config.rollout.calculate_log_probs = True
         
-        return rollout_config
+        print(f"[ROLLOUT_ONLY] Created config with model_path={rollout_only_config.model.path}")
+        print(f"[ROLLOUT_ONLY] Sampling params: temp={rollout_only_config.rollout.temperature}, top_p={rollout_only_config.rollout.top_p}, top_k={rollout_only_config.rollout.top_k}")
+        
+        return rollout_only_config
 
 
     def _generate_actor_rollouts(self, gen_batch: DataProto) -> DataProto:
         """Generate rollouts from actor policy only."""
+        print(f"[ACTOR_ROLLOUT] Starting actor policy generation for {gen_batch.batch['input_ids'].shape[0]} samples")
+        print(f"[ACTOR_ROLLOUT] Using actor model: {self.config.actor_rollout_ref.model.path}")
+        
         # Use existing rollout logic
         if not self.async_rollout_mode:
             gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
@@ -455,6 +464,7 @@ class RayPPOTrainer:
         
         # Mark as actor policy
         gen_batch_output.meta_info["policy_type"] = "current"
+        print(f"[ACTOR_ROLLOUT] Generated {gen_batch_output.batch['input_ids'].shape[0]} sequences from actor policy")
         return gen_batch_output
 
     def _generate_fixed_rollouts(self, gen_batch: DataProto) -> DataProto:
@@ -462,20 +472,29 @@ class RayPPOTrainer:
         if self.rollout_only_wg is None:
             raise ValueError("Rollout-only worker not initialized. Check rollout_only.model_path in config.")
         
+        print(f"[FIXED_ROLLOUT] Starting fixed policy generation for {gen_batch.batch['input_ids'].shape[0]} samples")
+        print(f"[FIXED_ROLLOUT] Using fixed policy model: {self.config.rollout_only.model_path}")
+        
         # Use rollout-only worker
         gen_batch_output = self.rollout_only_wg.generate_sequences(gen_batch)
         
         # Mark as fixed policy
         gen_batch_output.meta_info["policy_type"] = "reference"
+        print(f"[FIXED_ROLLOUT] Generated {gen_batch_output.batch['input_ids'].shape[0]} sequences from fixed policy")
         return gen_batch_output
 
     def _generate_rollouts(self, gen_batch: DataProto) -> DataProto:
         """Generate rollouts based on allocation schedule."""
         policy_choice = self.rollout_allocation_schedule.get_policy_choice(self.global_steps)
         
+        # Log policy choice for debugging
+        print(f"[ROLLOUT] Step {self.global_steps}: Using {policy_choice} policy")
+        
         if policy_choice == "actor":
+            print(f"[ROLLOUT] Generating {gen_batch.batch['input_ids'].shape[0]} samples from actor policy")
             return self._generate_actor_rollouts(gen_batch)
         else:
+            print(f"[ROLLOUT] Generating {gen_batch.batch['input_ids'].shape[0]} samples from fixed policy")
             return self._generate_fixed_rollouts(gen_batch)
 
     def _dump_generations(self, inputs, outputs, gts, scores, reward_extra_infos_dict, dump_path):
@@ -742,6 +761,7 @@ class RayPPOTrainer:
                 role="actor_rollout",
             )
             self.resource_pool_to_cls[resource_pool]["actor_rollout"] = actor_rollout_cls
+            print(f"[WORKER_INIT] Actor rollout worker will use model_path={self.config.actor_rollout_ref.model.path}")
         else:
             raise NotImplementedError
 
@@ -769,8 +789,9 @@ class RayPPOTrainer:
             rm_cls = RayClassWithInitArgs(self.role_worker_mapping[Role.RewardModel], config=self.config.reward_model)
             self.resource_pool_to_cls[resource_pool]["rm"] = rm_cls
 
-        # create rollout-only worker if configured
+        # create rollout-only worker if configured (independent of reward model)
         if Role.RolloutOnly in self.role_worker_mapping:
+            print(f"[WORKER_INIT] Creating rollout-only worker for fixed policy")
             resource_pool = self.resource_pool_manager.get_resource_pool(Role.RolloutOnly)
             
             # Create config by inheriting from actor_rollout_ref.rollout and overriding specific fields
@@ -782,6 +803,10 @@ class RayPPOTrainer:
                 role="rollout",  # Use "rollout" role for fixed policy
             )
             self.resource_pool_to_cls[resource_pool]["rollout_only"] = rollout_only_cls
+            print(f"[WORKER_INIT] Rollout-only worker will use model_path={rollout_only_config.model.path}")
+            print(f"[WORKER_INIT] Rollout-only worker created successfully")
+        else:
+            print(f"[WORKER_INIT] No rollout-only worker configured (rollout_only.model_path is null)")
 
         # initialize WorkerGroup
         # NOTE: if you want to use a different resource pool for each role, which can support different parallel size,
@@ -830,9 +855,12 @@ class RayPPOTrainer:
 
         # Initialize rollout-only worker if configured
         self.rollout_only_wg = None
-        if Role.RolloutOnly in self.role_worker_mapping:
+        if "rollout_only" in all_wg:
             self.rollout_only_wg = all_wg["rollout_only"]
             self.rollout_only_wg.init_model()
+            print(f"[WORKER_INIT] Rollout-only worker initialized successfully")
+        else:
+            print(f"[WORKER_INIT] No rollout-only worker found in all_wg")
 
         # we should create rollout at the end so that vllm can have a better estimation of kv cache memory
         self.actor_rollout_wg = all_wg["actor_rollout"]
@@ -1056,7 +1084,9 @@ class RayPPOTrainer:
         next_step_profile = False
 
         for epoch in range(self.config.trainer.total_epochs):
-            for batch_dict in self.train_dataloader:
+            print(f"[TRAINING_LOOP] Starting epoch {epoch}, global_steps={self.global_steps}")
+            for batch_idx, batch_dict in enumerate(self.train_dataloader):
+                print(f"[TRAINING_LOOP] Processing batch {batch_idx}, global_steps={self.global_steps}")
                 metrics = {}
                 timing_raw = {}
 
@@ -1066,24 +1096,33 @@ class RayPPOTrainer:
                         if self.config.global_profiler.profile_continuous_steps
                         else curr_step_profile
                     )
+                print(f"[TRAINING_LOOP] Creating DataProto from batch_dict")
                 batch: DataProto = DataProto.from_single_dict(batch_dict)
+                print(f"[TRAINING_LOOP] DataProto created, batch size: {len(batch.batch)}")
 
                 # add uid to batch
+                print(f"[TRAINING_LOOP] Adding UIDs to batch")
                 batch.non_tensor_batch["uid"] = np.array(
                     [str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object
                 )
 
+                print(f"[TRAINING_LOOP] Getting gen_batch from batch")
                 gen_batch = self._get_gen_batch(batch)
 
                 # pass global_steps to trace
+                print(f"[TRAINING_LOOP] Setting global_steps in gen_batch meta_info")
                 gen_batch.meta_info["global_steps"] = self.global_steps
+                print(f"[TRAINING_LOOP] Repeating gen_batch {self.config.actor_rollout_ref.rollout.n} times")
                 gen_batch = gen_batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
 
                 is_last_step = self.global_steps >= self.total_training_steps
+                print(f"[TRAINING_LOOP] Starting step processing, is_last_step={is_last_step}")
                 with marked_timer("step", timing_raw):
                     # generate a batch using allocation schedule
+                    print(f"[TRAINING_LOOP] About to generate rollouts")
                     with marked_timer("gen", timing_raw, color="red"):
                         gen_batch_output = self._generate_rollouts(gen_batch)
+                        print(f"[TRAINING_LOOP] Rollouts generated successfully")
                         
                         # Log policy choice for monitoring
                         policy_choice = gen_batch_output.meta_info.get("policy_type", "unknown")
@@ -1096,6 +1135,7 @@ class RayPPOTrainer:
                         timing_raw.update(gen_batch_output.meta_info.get("timing", {}))
                         gen_batch_output.meta_info.pop("timing", None)
 
+                    print(f"[TRAINING_LOOP] Checking for REMAX advantage estimator")
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
                         if self.reward_fn is None:
                             raise ValueError("A reward_fn is required for REMAX advantage estimation.")
@@ -1117,7 +1157,9 @@ class RayPPOTrainer:
 
                             del gen_baseline_batch, gen_baseline_output
                     # repeat to align with repeated responses in rollout
+                    print(f"[TRAINING_LOOP] Repeating batch to align with rollout responses")
                     batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
+                    print(f"[TRAINING_LOOP] Unioning batch with gen_batch_output")
                     batch = batch.union(gen_batch_output)
 
                     if "response_mask" not in batch.batch.keys():
@@ -1127,136 +1169,165 @@ class RayPPOTrainer:
                     # which won't affect the advantage calculation (since it's based on uid),
                     # but might affect the loss calculation (due to the change of mini-batching).
                     # TODO: Decouple the DP balancing and mini-batching.
+                    print(f"[TRAINING_LOOP] Checking balance_batch: {self.config.trainer.balance_batch}")
                     if self.config.trainer.balance_batch:
+                        print(f"[TRAINING_LOOP] Balancing batch")
                         self._balance_batch(batch, metrics=metrics)
 
                     # compute global_valid tokens
+                    print(f"[TRAINING_LOOP] Computing global_token_num")
                     batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
 
                     with marked_timer("reward", timing_raw, color="yellow"):
+                        print(f"[TRAINING_LOOP] Starting reward computation")
                         # compute reward model score
                         if self.use_rm and "rm_scores" not in batch.batch.keys():
+                            print(f"[TRAINING_LOOP] Computing reward model score")
                             reward_tensor = self.rm_wg.compute_rm_score(batch)
                             batch = batch.union(reward_tensor)
 
                         if self.config.reward_model.launch_reward_fn_async:
+                            print(f"[TRAINING_LOOP] Launching async reward computation")
                             future_reward = compute_reward_async.remote(data=batch, reward_fn=self.reward_fn)
                         else:
+                            print(f"[TRAINING_LOOP] Computing reward synchronously")
                             reward_tensor, reward_extra_infos_dict = compute_reward(batch, self.reward_fn)
 
-                    # recompute old_log_probs
-                    with marked_timer("old_log_prob", timing_raw, color="blue"):
-                        # For fixed policy samples, use fixed policy to calculate old_log_probs
-                        # For actor samples, use current actor policy
-                        policy_type = batch.meta_info.get("policy_type", "current")
-                        
-                        if policy_type == "reference" and self.rollout_only_wg is not None:
-                            # Use fixed policy to calculate old_log_probs for importance sampling
-                            old_log_prob = self.rollout_only_wg.compute_log_prob(batch)
+            # recompute old_log_probs
+            print(f"[TRAINING_LOOP] Starting old_log_prob computation")
+            with marked_timer("old_log_prob", timing_raw, color="blue"):
+                # For fixed policy samples, use fixed policy to calculate old_log_probs
+                # For actor samples, use current actor policy
+                policy_type = batch.meta_info.get("policy_type", "current")
+                
+                print(f"[OLD_LOG_PROB] Computing old_log_probs for {policy_type} policy samples")
+                
+                if policy_type == "reference" and self.rollout_only_wg is not None:
+                    # Use fixed policy to calculate old_log_probs for importance sampling
+                    print(f"[OLD_LOG_PROB] Using fixed policy model: {self.config.rollout_only.model_path}")
+                    old_log_prob = self.rollout_only_wg.compute_log_prob(batch)
+                else:
+                    # Use current actor policy (standard PPO)
+                    print(f"[OLD_LOG_PROB] Using current actor policy model: {self.config.actor_rollout_ref.model.path}")
+                    old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
+                
+                entropys = old_log_prob.batch["entropys"]
+                response_masks = batch.batch["response_mask"]
+                loss_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
+                entropy_agg = agg_loss(loss_mat=entropys, loss_mask=response_masks, loss_agg_mode=loss_agg_mode)
+                old_log_prob_metrics = {"actor/entropy": entropy_agg.detach().item()}
+                metrics.update(old_log_prob_metrics)
+                old_log_prob.batch.pop("entropys")
+                batch = batch.union(old_log_prob)
+                print(f"[TRAINING_LOOP] old_log_prob computation completed")
+
+                if "rollout_log_probs" in batch.batch.keys():
+                    # TODO: we may want to add diff of probs too.
+                    print(f"[TRAINING_LOOP] Computing debug metrics")
+                    from verl.utils.debug.metrics import calculate_debug_metrics
+
+                    metrics.update(calculate_debug_metrics(batch))
+
+                if self.use_reference_policy:
+                    # compute reference log_prob
+                    print(f"[TRAINING_LOOP] Computing reference log_prob")
+                    with marked_timer("ref", timing_raw, color="olive"):
+                        if not self.ref_in_actor:
+                            ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(batch)
                         else:
-                            # Use current actor policy (standard PPO)
-                            old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
-                        
-                        entropys = old_log_prob.batch["entropys"]
-                        response_masks = batch.batch["response_mask"]
-                        loss_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
-                        entropy_agg = agg_loss(loss_mat=entropys, loss_mask=response_masks, loss_agg_mode=loss_agg_mode)
-                        old_log_prob_metrics = {"actor/entropy": entropy_agg.detach().item()}
-                        metrics.update(old_log_prob_metrics)
-                        old_log_prob.batch.pop("entropys")
-                        batch = batch.union(old_log_prob)
+                            ref_log_prob = self.actor_rollout_wg.compute_ref_log_prob(batch)
+                        batch = batch.union(ref_log_prob)
 
-                        if "rollout_log_probs" in batch.batch.keys():
-                            # TODO: we may want to add diff of probs too.
-                            from verl.utils.debug.metrics import calculate_debug_metrics
+                # compute values
+                if self.use_critic:
+                    print(f"[TRAINING_LOOP] Computing values")
+                    with marked_timer("values", timing_raw, color="cyan"):
+                        values = self.critic_wg.compute_values(batch)
+                        batch = batch.union(values)
 
-                            metrics.update(calculate_debug_metrics(batch))
+                with marked_timer("adv", timing_raw, color="brown"):
+                    print(f"[TRAINING_LOOP] Starting advantage computation")
+                    # we combine with rule-based rm
+                    reward_extra_infos_dict: dict[str, list]
+                    if self.config.reward_model.launch_reward_fn_async:
+                        print(f"[TRAINING_LOOP] Getting async reward result")
+                        reward_tensor, reward_extra_infos_dict = ray.get(future_reward)
+                    batch.batch["token_level_scores"] = reward_tensor
 
-                    if self.use_reference_policy:
-                        # compute reference log_prob
-                        with marked_timer("ref", timing_raw, color="olive"):
-                            if not self.ref_in_actor:
-                                ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(batch)
-                            else:
-                                ref_log_prob = self.actor_rollout_wg.compute_ref_log_prob(batch)
-                            batch = batch.union(ref_log_prob)
+                    if reward_extra_infos_dict:
+                        batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
 
-                    # compute values
-                    if self.use_critic:
-                        with marked_timer("values", timing_raw, color="cyan"):
-                            values = self.critic_wg.compute_values(batch)
-                            batch = batch.union(values)
-
-                    with marked_timer("adv", timing_raw, color="brown"):
-                        # we combine with rule-based rm
-                        reward_extra_infos_dict: dict[str, list]
-                        if self.config.reward_model.launch_reward_fn_async:
-                            reward_tensor, reward_extra_infos_dict = ray.get(future_reward)
-                        batch.batch["token_level_scores"] = reward_tensor
-
-                        if reward_extra_infos_dict:
-                            batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
-
-                        # compute rewards. apply_kl_penalty if available
-                        if self.config.algorithm.use_kl_in_reward:
-                            batch, kl_metrics = apply_kl_penalty(
-                                batch, kl_ctrl=self.kl_ctrl_in_reward, kl_penalty=self.config.algorithm.kl_penalty
-                            )
-                            metrics.update(kl_metrics)
-                        else:
-                            batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
-
-                        # compute advantages, executed on the driver process
-                        norm_adv_by_std_in_grpo = self.config.algorithm.get(
-                            "norm_adv_by_std_in_grpo", True
-                        )  # GRPO adv normalization factor
-
-                        batch = compute_advantage(
-                            batch,
-                            adv_estimator=self.config.algorithm.adv_estimator,
-                            gamma=self.config.algorithm.gamma,
-                            lam=self.config.algorithm.lam,
-                            num_repeat=self.config.actor_rollout_ref.rollout.n,
-                            norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
-                            config=self.config.algorithm,
+                    # compute rewards. apply_kl_penalty if available
+                    if self.config.algorithm.use_kl_in_reward:
+                        batch, kl_metrics = apply_kl_penalty(
+                            batch, kl_ctrl=self.kl_ctrl_in_reward, kl_penalty=self.config.algorithm.kl_penalty
                         )
+                        metrics.update(kl_metrics)
+                    else:
+                        batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
 
-                    # update critic
-                    if self.use_critic:
-                        with marked_timer("update_critic", timing_raw, color="pink"):
-                            critic_output = self.critic_wg.update_critic(batch)
-                        critic_output_metrics = reduce_metrics(critic_output.meta_info["metrics"])
-                        metrics.update(critic_output_metrics)
+                    # compute advantages, executed on the driver process
+                    print(f"[TRAINING_LOOP] Computing advantages")
+                    norm_adv_by_std_in_grpo = self.config.algorithm.get(
+                        "norm_adv_by_std_in_grpo", True
+                    )  # GRPO adv normalization factor
 
-                    # implement critic warmup
-                    if self.config.trainer.critic_warmup <= self.global_steps:
-                        # Always update actor, but use importance sampling for fixed policy samples
-                        policy_type = batch.meta_info.get("policy_type", "current")
+                    batch = compute_advantage(
+                        batch,
+                        adv_estimator=self.config.algorithm.adv_estimator,
+                        gamma=self.config.algorithm.gamma,
+                        lam=self.config.algorithm.lam,
+                        num_repeat=self.config.actor_rollout_ref.rollout.n,
+                        norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+                        config=self.config.algorithm,
+                    )
+                    print(f"[TRAINING_LOOP] Advantage computation completed")
+
+                # update critic
+                if self.use_critic:
+                    print(f"[TRAINING_LOOP] Updating critic")
+                    with marked_timer("update_critic", timing_raw, color="pink"):
+                        critic_output = self.critic_wg.update_critic(batch)
+                    critic_output_metrics = reduce_metrics(critic_output.meta_info["metrics"])
+                    metrics.update(critic_output_metrics)
+
+                # implement critic warmup
+                print(f"[TRAINING_LOOP] Checking critic warmup: {self.config.trainer.critic_warmup} <= {self.global_steps}")
+                if self.config.trainer.critic_warmup <= self.global_steps:
+                    # Always update actor, but use importance sampling for fixed policy samples
+                    policy_type = batch.meta_info.get("policy_type", "current")
+                    
+                    print(f"[TRAINING_LOOP] Updating actor with {policy_type} policy")
+                    with marked_timer("update_actor", timing_raw, color="red"):
+                        batch.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
+                        actor_output = self.actor_rollout_wg.update_actor(batch)
                         
-                        with marked_timer("update_actor", timing_raw, color="red"):
-                            batch.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
-                            actor_output = self.actor_rollout_wg.update_actor(batch)
-                            
-                        actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
-                        metrics.update(actor_output_metrics)
-                        
-                        # Log policy type for monitoring
-                        if policy_type == "reference":
-                            metrics.update({"actor/using_fixed_policy": 1})
-                        else:
-                            metrics.update({"actor/using_current_policy": 1})
+                    actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
+                    metrics.update(actor_output_metrics)
+                    print(f"[TRAINING_LOOP] Actor update completed")
+                    
+                    # Log policy type for monitoring
+                    if policy_type == "reference":
+                        print(f"[ACTOR_UPDATE] Updating actor with fixed policy samples (importance sampling)")
+                        metrics.update({"actor/using_fixed_policy": 1})
+                    else:
+                        print(f"[ACTOR_UPDATE] Updating actor with current policy samples (standard PPO)")
+                        metrics.update({"actor/using_current_policy": 1})
 
-                    # Log rollout generations if enabled
-                    rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
-                    if rollout_data_dir:
-                        self._log_rollout_data(batch, reward_extra_infos_dict, timing_raw, rollout_data_dir)
+                # Log rollout generations if enabled
+                rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
+                if rollout_data_dir:
+                    print(f"[TRAINING_LOOP] Logging rollout data")
+                    self._log_rollout_data(batch, reward_extra_infos_dict, timing_raw, rollout_data_dir)
 
                 # validate
+                print(f"[TRAINING_LOOP] Checking validation conditions")
                 if (
                     self.val_reward_fn is not None
                     and self.config.trainer.test_freq > 0
                     and (is_last_step or self.global_steps % self.config.trainer.test_freq == 0)
                 ):
+                    print(f"[TRAINING_LOOP] Running validation")
                     with marked_timer("testing", timing_raw, color="green"):
                         val_metrics: dict = self._validate()
                         if is_last_step:
@@ -1264,6 +1335,7 @@ class RayPPOTrainer:
                     metrics.update(val_metrics)
 
                 # Check if the ESI (Elastic Server Instance)/training plan is close to expiration.
+                print(f"[TRAINING_LOOP] Checking checkpoint save conditions")
                 esi_close_to_expiration = should_save_ckpt_esi(
                     max_steps_duration=self.max_steps_duration,
                     redundant_time=self.config.trainer.esi_redundant_time,
@@ -1280,6 +1352,7 @@ class RayPPOTrainer:
                 ):
                     if esi_close_to_expiration:
                         print("Force saving checkpoint: ESI instance expiration approaching.")
+                    print(f"[TRAINING_LOOP] Saving checkpoint")
                     with marked_timer("save_checkpoint", timing_raw, color="green"):
                         self._save_checkpoint()
 
@@ -1301,6 +1374,7 @@ class RayPPOTrainer:
                 self.max_steps_duration = max(self.max_steps_duration, steps_duration)
 
                 # training metrics
+                print(f"[TRAINING_LOOP] Computing training metrics")
                 metrics.update(
                     {
                         "training/global_step": self.global_steps,
@@ -1319,20 +1393,25 @@ class RayPPOTrainer:
                     self.train_dataloader.sampler.update(batch=batch)
 
                 # TODO: make a canonical logger that supports various backend
+                print(f"[TRAINING_LOOP] Logging metrics")
                 logger.log(data=metrics, step=self.global_steps)
 
+                print(f"[TRAINING_LOOP] Updating progress bar and incrementing global_steps")
                 progress_bar.update(1)
                 self.global_steps += 1
+                print(f"[TRAINING_LOOP] Batch {batch_idx} completed, global_steps now = {self.global_steps}")
 
                 if (
                     hasattr(self.config.actor_rollout_ref.actor, "profiler")
                     and self.config.actor_rollout_ref.actor.profiler.tool == "torch_memory"
                 ):
+                    print(f"[TRAINING_LOOP] Dumping memory snapshot")
                     self.actor_rollout_wg.dump_memory_snapshot(
                         tag=f"post_update_step{self.global_steps}", sub_dir=f"step{self.global_steps}"
                     )
 
                 if is_last_step:
+                    print(f"[TRAINING_LOOP] Training completed - last step reached")
                     pprint(f"Final validation metrics: {last_val_metrics}")
                     progress_bar.close()
                     return
@@ -1340,5 +1419,8 @@ class RayPPOTrainer:
                 # this is experimental and may be changed/removed in the future
                 # in favor of a general-purpose data buffer pool
                 if hasattr(self.train_dataset, "on_batch_end"):
+                    print(f"[TRAINING_LOOP] Calling dataset on_batch_end")
                     # The dataset may be changed after each training batch
                     self.train_dataset.on_batch_end(batch=batch)
+                
+                print(f"[TRAINING_LOOP] Moving to next batch")

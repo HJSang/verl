@@ -16,6 +16,7 @@ import importlib.util
 import multiprocessing
 import os
 import sys
+import time
 import warnings
 from functools import partial
 from typing import Any, Optional
@@ -108,6 +109,8 @@ def load_reward_manager(
     Returns:
         An instance of the specified reward manager class.
     """
+    load_start_time = time.time()
+    print(f"[LOAD_REWARD_MANAGER] Starting reward manager loading at {time.strftime('%H:%M:%S')}")
 
     # The list of pre-defined reward managers are defined in `verl/workers/reward_manager/`:
     # naive: NaiveRewardManager
@@ -118,17 +121,29 @@ def load_reward_manager(
     # registered via `verl.workers.reward_manager.register`
     # By default reward_manager is set to naive (NaiveRewardManager)
     reward_manager_name = config.reward_model.get("reward_manager", "naive")
+    print(f"[LOAD_REWARD_MANAGER] Loading reward manager: {reward_manager_name}")
+    
+    get_cls_start = time.time()
     reward_manager_cls = get_reward_manager_cls(reward_manager_name)
+    get_cls_end = time.time()
+    print(f"[LOAD_REWARD_MANAGER] Got reward manager class in {get_cls_end - get_cls_start:.2f} seconds")
 
     # Try to get a custom reward function based on the configuration
+    print(f"[LOAD_REWARD_MANAGER] Getting custom reward function")
+    custom_fn_start = time.time()
     compute_score = get_custom_reward_fn(config)
+    custom_fn_end = time.time()
+    print(f"[LOAD_REWARD_MANAGER] Custom reward function processing completed in {custom_fn_end - custom_fn_start:.2f} seconds")
+    
     final_compute_score = compute_score
 
     if compute_score is None:
+        print(f"[LOAD_REWARD_MANAGER] No custom reward function, using default")
         sandbox_config = config.reward_model.get("sandbox_fusion")
         sandbox_url = sandbox_config.get("url") if sandbox_config else None
         memory_limit_mb = sandbox_config.get("memory_limit_mb", 1024)
         if sandbox_url:
+            print(f"[LOAD_REWARD_MANAGER] Setting up sandbox fusion")
             sandbox_manager = multiprocessing.Manager()
             # Create a semaphore to control concurrent access to the sandbox
             _concurrent_semaphore = sandbox_manager.Semaphore(sandbox_config.get("max_concurrent", 64))
@@ -142,13 +157,24 @@ def load_reward_manager(
             final_compute_score = default_compute_score
 
     # Instantiate and return the reward manager with the specified parameters
-    return reward_manager_cls(
+    print(f"[LOAD_REWARD_MANAGER] Instantiating reward manager")
+    instantiate_start = time.time()
+    reward_manager = reward_manager_cls(
         tokenizer=tokenizer,
         num_examine=num_examine,
         compute_score=final_compute_score,
         reward_fn_key=config.data.reward_fn_key,
         **reward_kwargs,
     )
+    instantiate_end = time.time()
+    print(f"[LOAD_REWARD_MANAGER] Reward manager instantiated in {instantiate_end - instantiate_start:.2f} seconds")
+    
+    load_end_time = time.time()
+    total_load_time = load_end_time - load_start_time
+    print(f"[LOAD_REWARD_MANAGER] Total reward manager loading time: {total_load_time:.2f} seconds")
+    print(f"[LOAD_REWARD_MANAGER] Reward manager loading completed at {time.strftime('%H:%M:%S')}")
+    
+    return reward_manager
 
 
 def compute_reward(data: DataProto, reward_fn: AbstractRewardManager) -> tuple[torch.Tensor, dict[str, Any]]:
@@ -160,15 +186,35 @@ def compute_reward(data: DataProto, reward_fn: AbstractRewardManager) -> tuple[t
     Returns:
         Tuple of reward tensor and extra info dictionary.
     """
+    start_time = time.time()
+    print(f"[COMPUTE_REWARD] Starting reward computation at {time.strftime('%H:%M:%S')}")
+    print(f"[COMPUTE_REWARD] Reward function type: {type(reward_fn)}")
+    print(f"[COMPUTE_REWARD] Data batch size: {len(data.batch)}")
+    
     try:
+        print(f"[COMPUTE_REWARD] Calling reward_fn with return_dict=True")
+        reward_fn_start = time.time()
         reward_result = reward_fn(data, return_dict=True)
+        reward_fn_end = time.time()
+        print(f"[COMPUTE_REWARD] Reward function call completed in {reward_fn_end - reward_fn_start:.2f} seconds")
+        
         reward_tensor = reward_result["reward_tensor"]
         reward_extra_infos_dict = reward_result.get("reward_extra_info", {})
+        print(f"[COMPUTE_REWARD] Reward computation successful")
     except Exception as e:
-        print(f"Error in reward_fn: {e}")
+        print(f"[COMPUTE_REWARD] Error in reward_fn: {e}")
+        print(f"[COMPUTE_REWARD] Trying fallback reward computation")
+        fallback_start = time.time()
         reward_tensor = reward_fn(data)
+        fallback_end = time.time()
+        print(f"[COMPUTE_REWARD] Fallback reward computation completed in {fallback_end - fallback_start:.2f} seconds")
         reward_extra_infos_dict = {}
 
+    end_time = time.time()
+    total_time = end_time - start_time
+    print(f"[COMPUTE_REWARD] Total reward computation time: {total_time:.2f} seconds")
+    print(f"[COMPUTE_REWARD] Reward computation completed at {time.strftime('%H:%M:%S')}")
+    
     return reward_tensor, reward_extra_infos_dict
 
 
@@ -178,14 +224,29 @@ def compute_reward_async(data: DataProto, config=None, tokenizer=None, reward_fn
     Load the reward manager and compute the reward for a batch of data.
     This is meant to be run in a separate Ray worker.
     """
+    async_start_time = time.time()
+    print(f"[COMPUTE_REWARD_ASYNC] Starting async reward computation at {time.strftime('%H:%M:%S')}")
+    
     if reward_fn is None:
         assert config is not None and tokenizer is not None, (
             "config and tokenizer must not be None when reward_fn is None"
         )
 
         warnings.warn("using config and tokenizer with compute_reward_async is deprecated", stacklevel=2)
+        print(f"[COMPUTE_REWARD_ASYNC] Loading reward manager from config")
+        load_start = time.time()
         reward_fn = load_reward_manager(
             config, tokenizer, num_examine=0, **config.reward_model.get("reward_kwargs", {})
         )
+        load_end = time.time()
+        print(f"[COMPUTE_REWARD_ASYNC] Reward manager loaded in {load_end - load_start:.2f} seconds")
 
-    return compute_reward(data, reward_fn)
+    print(f"[COMPUTE_REWARD_ASYNC] Calling compute_reward")
+    result = compute_reward(data, reward_fn)
+    
+    async_end_time = time.time()
+    async_total_time = async_end_time - async_start_time
+    print(f"[COMPUTE_REWARD_ASYNC] Total async reward computation time: {async_total_time:.2f} seconds")
+    print(f"[COMPUTE_REWARD_ASYNC] Async reward computation completed at {time.strftime('%H:%M:%S')}")
+    
+    return result

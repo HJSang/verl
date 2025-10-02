@@ -940,7 +940,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     def compute_log_prob(self, data: DataProto):
         # when is_lora is True, we use the actor without lora applied to calculate the log_prob
         # which is mostly used for ref log_prob calculation
-        assert self._is_actor
+        # assert self._is_actor or self._is_rollout
         if self._is_offload_param:
             load_fsdp_model_to_gpu(self.actor_module_fsdp)
 
@@ -948,16 +948,41 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         from contextlib import nullcontext
 
         is_lora = data.meta_info.pop("is_lora", False)
-        adapter_ctx = self.actor.actor_module.disable_adapter() if is_lora else nullcontext()
+        
+        # Handle both actor and rollout-only workers
+        if self._is_actor:
+            # For actor workers, use self.actor
+            adapter_ctx = self.actor.actor_module.disable_adapter() if is_lora else nullcontext()
+            actor_module = self.actor.actor_module
+        else:
+            # For rollout-only workers, use self.actor_module_fsdp directly
+            adapter_ctx = nullcontext()  # No LoRA for rollout-only
+            actor_module = self.actor_module_fsdp
+            
         # we should always recompute old_log_probs when it is HybridEngine
         data.meta_info["micro_batch_size"] = self.config.rollout.log_prob_micro_batch_size_per_gpu
         data.meta_info["max_token_len"] = self.config.rollout.log_prob_max_token_len_per_gpu
         data.meta_info["use_dynamic_bsz"] = self.config.rollout.log_prob_use_dynamic_bsz
         data.meta_info["temperature"] = self.config.rollout.temperature
+        
         # perform recompute log_prob
         with self.ulysses_sharding_manager:
             with adapter_ctx:
-                output, entropys = self.actor.compute_log_prob(data=data, calculate_entropy=True)
+                if self._is_actor:
+                    # Use actor's compute_log_prob method
+                    output, entropys = self.actor.compute_log_prob(data=data, calculate_entropy=True)
+                else:
+                    # For rollout-only, we need to implement log_prob computation directly
+                    # This is a simplified version - you might need to adapt based on your specific needs
+                    from verl.workers.actor import DataParallelPPOActor
+                    # Create a temporary actor instance for computation
+                    temp_actor = DataParallelPPOActor(
+                        config=self.config.rollout, 
+                        actor_module=actor_module, 
+                        actor_optimizer=None
+                    )
+                    output, entropys = temp_actor.compute_log_prob(data=data, calculate_entropy=True)
+                    
             output = DataProto.from_dict(
                 tensors={"old_log_probs": output, "entropys": entropys},
                 meta_info={"temperature": self.config.rollout.temperature},
@@ -967,8 +992,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         # https://pytorch.org/docs/stable/notes/fsdp.html#fsdp-notes
         # unshard the root FSDP module
-        if self.world_size > 1 and fsdp_version(self.actor.actor_module) == 1:
-            self.actor.actor_module._handle.reshard(True)
+        if self.world_size > 1 and fsdp_version(actor_module) == 1:
+            actor_module._handle.reshard(True)
 
         if self._is_offload_param:
             offload_fsdp_model_to_cpu(self.actor_module_fsdp)

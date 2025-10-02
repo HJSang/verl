@@ -54,10 +54,9 @@ class ConstantSchedule(RolloutAllocationSchedule):
         self.alpha = alpha
         
     def get_policy_choice(self, step: int) -> Literal["actor", "fixed"]:
-        if random.random() < self.alpha:
-            return "actor"
-        else:
-            return "fixed"
+        choice = "actor" if random.random() < self.alpha else "fixed"
+        print(f"[CONSTANT_SCHEDULE] Step {step}: alpha={self.alpha:.3f}, choice={choice}")
+        return choice
 
 
 class LinearSchedule(RolloutAllocationSchedule):
@@ -84,11 +83,9 @@ class LinearSchedule(RolloutAllocationSchedule):
     def get_policy_choice(self, step: int) -> Literal["actor", "fixed"]:
         # Compute current alpha
         alpha = min(self.alpha_0 + self.beta * step, self.max_alpha)
-        
-        if random.random() < alpha:
-            return "actor"
-        else:
-            return "fixed"
+        choice = "actor" if random.random() < alpha else "fixed"
+        print(f"[LINEAR_SCHEDULE] Step {step}: alpha={alpha:.3f} (alpha_0={self.alpha_0:.3f}, beta={self.beta:.3f}), choice={choice}")
+        return choice
 
 
 class ExponentialSchedule(RolloutAllocationSchedule):
@@ -105,10 +102,9 @@ class ExponentialSchedule(RolloutAllocationSchedule):
         
     def get_policy_choice(self, step: int) -> Literal["actor", "fixed"]:
         alpha = 1 - np.exp(-self.gamma * step)
-        if random.random() < alpha:
-            return "actor"
-        else:
-            return "fixed"
+        choice = "actor" if random.random() < alpha else "fixed"
+        print(f"[EXPONENTIAL_SCHEDULE] Step {step}: alpha={alpha:.3f} (gamma={self.gamma:.3f}), choice={choice}")
+        return choice
 
 
 class StepSchedule(RolloutAllocationSchedule):
@@ -134,9 +130,12 @@ class StepSchedule(RolloutAllocationSchedule):
         
         # Alternate between policies based on number of switches
         if switches % 2 == 0:
-            return self.initial_policy
+            choice = self.initial_policy
         else:
-            return "fixed" if self.initial_policy == "actor" else "actor"
+            choice = "fixed" if self.initial_policy == "actor" else "actor"
+        
+        print(f"[STEP_SCHEDULE] Step {step}: switches={switches}, switch_steps={self.switch_steps}, choice={choice}")
+        return choice
 
 
 def create_rollout_allocation_schedule(config: dict) -> RolloutAllocationSchedule:

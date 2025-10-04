@@ -68,10 +68,10 @@ class DataParallelPPOActor(BasePPOActor):
         if torch.distributed.get_rank() == 0:
             print(f"{role} use_fused_kernels={self.use_fused_kernels}")
 
-        self.ulysses_sequence_parallel_size = self.config.ulysses_sequence_parallel_size
+        self.ulysses_sequence_parallel_size = self.config.get("ulysses_sequence_parallel_size", 1)
         self.use_ulysses_sp = self.ulysses_sequence_parallel_size > 1
 
-        if self.config.entropy_from_logits_with_chunking:
+        if self.config.get("entropy_from_logits_with_chunking", False):
             entropy_from_logits = verl_F.entropy_from_logits_with_chunking
         else:
             entropy_from_logits = verl_F.entropy_from_logits
@@ -196,7 +196,7 @@ class DataParallelPPOActor(BasePPOActor):
 
                     # compute entropy
                     if calculate_entropy:
-                        if not self.config.entropy_checkpointing:
+                        if not self.config.get("entropy_checkpointing", False):
                             entropy_rmpad = self.compute_entropy_from_logits(logits_rmpad)  # ((total_nnz / sp) + pad)
                         else:
                             entropy_rmpad = torch.utils.checkpoint.checkpoint(
@@ -265,7 +265,7 @@ class DataParallelPPOActor(BasePPOActor):
                     logits = logits[:, -response_length - 1 : -1, :]  # (bsz, response_length, vocab_size)
                     log_probs = logprobs_from_logits(logits, micro_batch["responses"])
                     if calculate_entropy:
-                        if not self.config.entropy_checkpointing:
+                        if not self.config.get("entropy_checkpointing", False):
                             entropy = verl_F.entropy_from_logits(logits)  # (bsz, response_length)
                         else:
                             entropy = torch.utils.checkpoint.checkpoint(verl_F.entropy_from_logits, logits)
@@ -273,14 +273,14 @@ class DataParallelPPOActor(BasePPOActor):
             return entropy, log_probs
 
     def _optimizer_step(self):
-        assert self.config.grad_clip is not None
+        assert self.config.get("grad_clip", 1.0) is not None
 
         if isinstance(self.actor_module, FSDP):
-            grad_norm = self.actor_module.clip_grad_norm_(max_norm=self.config.grad_clip)
+            grad_norm = self.actor_module.clip_grad_norm_(max_norm=self.config.get("grad_clip", 1.0))
         elif isinstance(self.actor_module, FSDPModule):
-            grad_norm = fsdp2_clip_grad_norm_(self.actor_module.parameters(), max_norm=self.config.grad_clip)
+            grad_norm = fsdp2_clip_grad_norm_(self.actor_module.parameters(), max_norm=self.config.get("grad_clip", 1.0))
         else:
-            grad_norm = torch.nn.utils.clip_grad_norm_(self.actor_module.parameters(), max_norm=self.config.grad_clip)
+            grad_norm = torch.nn.utils.clip_grad_norm_(self.actor_module.parameters(), max_norm=self.config.get("grad_clip", 1.0))
 
         if isinstance(grad_norm, DTensor):
             grad_norm = grad_norm.full_tensor()

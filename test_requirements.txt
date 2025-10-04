@@ -1,0 +1,4 @@
+datasets==4.0.0
+transformers==4.56.2
+torch_memory_saver==0.0.8
+sglang==0.5.2

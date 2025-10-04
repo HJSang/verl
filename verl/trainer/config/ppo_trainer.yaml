@@ -306,3 +306,35 @@ ray_kwargs:
 
   # Path to save Ray timeline JSON for performance profiling
   timeline_json_file: null
+
+# config for rollout-only model (fixed policy)
+rollout_only:
+  # Model path for fixed policy (only difference from actor_rollout)
+  model_path: null
+  
+  # Sampling parameters (only differences from actor_rollout)
+  temperature: 1.0
+  top_p: 0.9
+  top_k: 50
+  
+  # All other parameters are inherited from actor_rollout_ref.rollout
+
+# config for rollout allocation schedule
+rollout_allocation_schedule:
+  # Schedule type: "constant", "linear", "exponential", "step"
+  type: "constant"
+  
+  # Constant schedule parameters
+  alpha: 0.5  # Probability of using actor policy
+  
+  # Linear schedule parameters
+  alpha_0: 0.1  # Initial alpha value
+  beta: 0.01    # Linear increase rate per step
+  max_alpha: 1.0  # Maximum alpha value
+  
+  # Exponential schedule parameters
+  gamma: 0.1  # Exponential decay rate
+  
+  # Step schedule parameters
+  switch_steps: [100, 500, 1000]  # Steps at which to switch policies
+  initial_policy: "fixed"  # Initial policy to use
